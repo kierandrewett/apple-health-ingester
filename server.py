@@ -475,8 +475,6 @@ def influx_query(query: str, database: str | None = INFLUX_DATABASE) -> None:
 SCALE_DATABASE = os.environ.get("HEALTHMD_SCALE_DATABASE", "homeassistant")
 SCALE_DEVICE = os.environ.get("HEALTHMD_SCALE_DEVICE", "smart_scale_p2_pro")
 SCALE_PROFILE = os.environ.get("HEALTHMD_SCALE_PROFILE", "")
-# A value belongs to the weigh-in when it was written this close to the weight.
-SCALE_READING_WINDOW_S = 600
 
 
 def scale_fields() -> dict[str, tuple[str, str]]:
@@ -490,10 +488,39 @@ def scale_fields() -> dict[str, tuple[str, str]]:
     }
 
 
-def influx_last(database: str, measurement: str, entity_id: str) -> tuple[datetime, float] | None:
+def influx_points(database: str, query: str) -> list[tuple[datetime, float]]:
+    request = Request(
+        f"{INFLUX_URL}/query",
+        data=urlencode({"q": query, "db": database, "epoch": "s"}).encode("utf-8"),
+        method="POST",
+    )
+    with urlopen(request, timeout=10) as response:
+        body = json.loads(response.read() or b"{}")
+    points: list[tuple[datetime, float]] = []
+    for result in body.get("results", []):
+        if "error" in result:
+            raise OSError("InfluxDB query failed")
+        for series in result.get("series", []):
+            for timestamp, value in series.get("values", []):
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    points.append((datetime.fromtimestamp(timestamp, timezone.utc), float(value)))
+    return points
+
+
+# Home Assistant also rewrites the restored weight on every restart, so the
+# time of the latest weight point is not the weigh-in time. The scale
+# integration stamps each real weigh-in in the weight sensor's measured_at
+# attribute, restored with the state; InfluxDB keeps it as measured_at_str.
+# Values from the same weigh-in are written within seconds of it, so only that
+# short span after it is read.
+WEIGH_IN_SPAN_BEFORE_S = 60
+WEIGH_IN_SPAN_AFTER_S = 180
+
+
+def latest_weigh_in(database: str) -> tuple[datetime, float] | None:
     query = (
-        f'SELECT last("value") FROM "{measurement}" '
-        f"WHERE \"entity_id\" = '{entity_id}' AND time > now() - 30d"
+        'SELECT last("measured_at_str"), last("value") FROM "kg" '
+        f"WHERE \"entity_id\" = '{SCALE_DEVICE}_weight' AND time > now() - 30d"
     )
     request = Request(
         f"{INFLUX_URL}/query",
@@ -506,24 +533,37 @@ def influx_last(database: str, measurement: str, entity_id: str) -> tuple[dateti
         if "error" in result:
             raise OSError("InfluxDB query failed")
         for series in result.get("series", []):
-            for timestamp, value in series.get("values", []):
-                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-                    return datetime.fromtimestamp(timestamp, timezone.utc), float(value)
+            for _time, measured_at, weight in series.get("values", []):
+                if not isinstance(measured_at, str) or not isinstance(weight, (int, float)):
+                    continue
+                stamp = coerce_timestamp(measured_at)
+                if stamp is not None and math.isfinite(weight):
+                    return stamp, float(weight)
     return None
 
 
 def latest_scale_reading() -> dict[str, Any] | None:
-    """The latest weigh-in: weight plus every value written with it."""
-    fields = scale_fields()
-    weight = influx_last(SCALE_DATABASE, *fields["weight_kg"])
-    if weight is None:
+    """The latest weigh-in: its weight plus each value written just after it."""
+    weigh_in = latest_weigh_in(SCALE_DATABASE)
+    if weigh_in is None:
         return None
-    measured_at, _ = weight
-    reading: dict[str, Any] = {"measured_at": measured_at.isoformat().replace("+00:00", "Z")}
-    for name, (measurement, entity_id) in fields.items():
-        found = influx_last(SCALE_DATABASE, measurement, entity_id)
-        if found is not None and abs((found[0] - measured_at).total_seconds()) <= SCALE_READING_WINDOW_S:
-            reading[name] = round(found[1], 2)
+    measured_at, weight = weigh_in
+    reading: dict[str, Any] = {
+        "measured_at": measured_at.isoformat().replace("+00:00", "Z"),
+        "weight_kg": round(weight, 2),
+    }
+    start = int(measured_at.timestamp()) - WEIGH_IN_SPAN_BEFORE_S
+    end = int(measured_at.timestamp()) + WEIGH_IN_SPAN_AFTER_S
+    for name, (measurement, entity_id) in scale_fields().items():
+        if name == "weight_kg":
+            continue
+        values = influx_points(
+            SCALE_DATABASE,
+            f'SELECT first("value") FROM "{measurement}" WHERE "entity_id" = \'{entity_id}\' '
+            f"AND time >= {start}s AND time <= {end}s",
+        )
+        if values:
+            reading[name] = round(values[0][1], 2)
     return reading
 
 

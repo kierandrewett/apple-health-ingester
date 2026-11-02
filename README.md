@@ -15,7 +15,7 @@ It stores each accepted upload on disk and writes normalised observations to the
 
 Both `POST` endpoints and `GET /scale/latest` need `Authorization: Bearer <token>`. The `POST` endpoints also need `Content-Type: application/json`.
 
-`/scale/latest` returns `measured_at` (UTC, ISO 8601) and whichever of `weight_kg`, `heart_rate_bpm`, `body_fat_percent`, `lean_body_mass_kg` and `bmi` were written within 10 minutes of the weight. It is off until `HEALTHMD_SCALE_PROFILE` is set.
+`/scale/latest` returns `measured_at` (UTC, ISO 8601) from the scale weight sensor's `measured_at` attribute, so a Home Assistant restart does not look like a new weigh-in, plus whichever of `weight_kg`, `heart_rate_bpm`, `body_fat_percent`, `lean_body_mass_kg` and `bmi` were written from 1 minute before to 3 minutes after it. It is off until `HEALTHMD_SCALE_PROFILE` is set.
 
 ## Configuration
 
