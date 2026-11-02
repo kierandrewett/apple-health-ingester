@@ -489,6 +489,11 @@ def synchronise_observations(source: str, partition: str, observations: list[dic
         f"WHERE \"source\" = '{source}' AND \"partition\" = '{partition}'"
     )
     lines: list[str] = []
+    # InfluxDB keeps one point per series and timestamp. Two samples of one
+    # metric can end at the same instant, for example two meals logged
+    # together, so later ones move forward by a nanosecond instead of
+    # overwriting the first.
+    used_timestamps: set[tuple[str, int]] = set()
     for observation in observations:
         metric = observation["metric"]
         unit = observation["unit"]
@@ -508,6 +513,9 @@ def synchronise_observations(source: str, partition: str, observations: list[dic
             )
         )
         timestamp_nanoseconds = int(timestamp.timestamp() * 1_000_000_000)
+        while (tags, timestamp_nanoseconds) in used_timestamps:
+            timestamp_nanoseconds += 1
+        used_timestamps.add((tags, timestamp_nanoseconds))
         lines.append(f"{HEALTH_OBSERVATION_MEASUREMENT},{tags} {fields} {timestamp_nanoseconds}")
     if lines:
         write_influx_points("\n".join(lines).encode("utf-8"))
