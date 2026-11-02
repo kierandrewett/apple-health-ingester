@@ -467,6 +467,66 @@ def influx_query(query: str, database: str | None = INFLUX_DATABASE) -> None:
             raise OSError("InfluxDB query failed")
 
 
+# Read-only view of the latest smart scale weigh-in, for an iPhone Shortcut that
+# logs it to Apple Health. It uses the same bearer token as the uploads and
+# returns only these values. Home Assistant writes the scale sensors to its
+# own InfluxDB database; the measurement is the unit, or the entity for
+# unitless sensors.
+SCALE_DATABASE = os.environ.get("HEALTHMD_SCALE_DATABASE", "homeassistant")
+SCALE_DEVICE = os.environ.get("HEALTHMD_SCALE_DEVICE", "smart_scale_p2_pro")
+SCALE_PROFILE = os.environ.get("HEALTHMD_SCALE_PROFILE", "")
+# A value belongs to the weigh-in when it was written this close to the weight.
+SCALE_READING_WINDOW_S = 600
+
+
+def scale_fields() -> dict[str, tuple[str, str]]:
+    device, profile = SCALE_DEVICE, SCALE_PROFILE
+    return {
+        "weight_kg": ("kg", f"{device}_weight"),
+        "heart_rate_bpm": ("bpm", f"{device}_heart_rate"),
+        "body_fat_percent": ("%", f"{device}_body_fat_{profile}"),
+        "lean_body_mass_kg": ("kg", f"{device}_lean_body_mass_{profile}"),
+        "bmi": (f"sensor.{device}_bmi_{profile}", f"{device}_bmi_{profile}"),
+    }
+
+
+def influx_last(database: str, measurement: str, entity_id: str) -> tuple[datetime, float] | None:
+    query = (
+        f'SELECT last("value") FROM "{measurement}" '
+        f"WHERE \"entity_id\" = '{entity_id}' AND time > now() - 30d"
+    )
+    request = Request(
+        f"{INFLUX_URL}/query",
+        data=urlencode({"q": query, "db": database, "epoch": "s"}).encode("utf-8"),
+        method="POST",
+    )
+    with urlopen(request, timeout=10) as response:
+        body = json.loads(response.read() or b"{}")
+    for result in body.get("results", []):
+        if "error" in result:
+            raise OSError("InfluxDB query failed")
+        for series in result.get("series", []):
+            for timestamp, value in series.get("values", []):
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    return datetime.fromtimestamp(timestamp, timezone.utc), float(value)
+    return None
+
+
+def latest_scale_reading() -> dict[str, Any] | None:
+    """The latest weigh-in: weight plus every value written with it."""
+    fields = scale_fields()
+    weight = influx_last(SCALE_DATABASE, *fields["weight_kg"])
+    if weight is None:
+        return None
+    measured_at, _ = weight
+    reading: dict[str, Any] = {"measured_at": measured_at.isoformat().replace("+00:00", "Z")}
+    for name, (measurement, entity_id) in fields.items():
+        found = influx_last(SCALE_DATABASE, measurement, entity_id)
+        if found is not None and abs((found[0] - measured_at).total_seconds()) <= SCALE_READING_WINDOW_S:
+            reading[name] = round(found[1], 2)
+    return reading
+
+
 def write_influx_points(body: bytes) -> None:
     request = Request(
         f"{INFLUX_URL}/write?{urlencode({'db': INFLUX_DATABASE, 'precision': 'ns'})}",
@@ -559,8 +619,25 @@ class HealthReceiverHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self) -> None:
-        if self.path.split("?", 1)[0] == "/healthz":
+        path = self.path.split("?", 1)[0]
+        if path == "/healthz":
             self.send_json(HTTPStatus.OK, {"status": "ok"})
+            return
+        if path == "/scale/latest":
+            if not AUTH_TOKEN or not SCALE_PROFILE or not hmac.compare_digest(
+                self.headers.get("Authorization", ""), f"Bearer {AUTH_TOKEN}"
+            ):
+                self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorised"})
+                return
+            try:
+                reading = latest_scale_reading()
+            except (OSError, ValueError):
+                self.send_json(HTTPStatus.BAD_GATEWAY, {"error": "scale_data_unavailable"})
+                return
+            if reading is None:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "no_reading"})
+                return
+            self.send_json(HTTPStatus.OK, reading)
             return
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
