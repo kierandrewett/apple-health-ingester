@@ -57,7 +57,48 @@ HEALTHMD_OBSERVATION_MAPPINGS = {
     ),
     "HKQuantityTypeIdentifierWalkingSpeed": ("walking_speed", "m/s", "m_per_s", 1.0),
     "HKQuantityTypeIdentifierWalkingStepLength": ("step_length", "m", "cm", 100.0),
+    # HealthKit stores percentage types as a 0..1 fraction under the "%" unit.
+    "HKQuantityTypeIdentifierAppleWalkingSteadiness": ("walking_steadiness_percent", "%", "percent", 1.0),
+    "HKQuantityTypeIdentifierHeadphoneAudioExposure": ("headphone_audio_level", "dBASPL", "dBASPL", 1.0),
+    "HKQuantityTypeIdentifierBodyMass": ("weight", "kg", "kg", 1.0),
+    "HKQuantityTypeIdentifierLeanBodyMass": ("lean_body_mass", "kg", "kg", 1.0),
+    "HKQuantityTypeIdentifierBodyFatPercentage": ("body_fat_percent", "%", "percent", 1.0),
+    "HKQuantityTypeIdentifierBodyMassIndex": ("body_mass_index", "count", "count", 1.0),
+    "HKQuantityTypeIdentifierHeight": ("height", "m", "cm", 100.0),
 }
+# Nutrition samples keep their HealthKit unit, so each maps one-to-one.
+HEALTHMD_DIETARY_MAPPINGS = {
+    "DietaryEnergyConsumed": ("dietary_energy", "kcal"),
+    "DietaryProtein": ("dietary_protein", "g"),
+    "DietaryCarbohydrates": ("dietary_carbohydrates", "g"),
+    "DietarySugar": ("dietary_sugar", "g"),
+    "DietaryFiber": ("dietary_fibre", "g"),
+    "DietaryFatTotal": ("dietary_fat_total", "g"),
+    "DietaryFatSaturated": ("dietary_fat_saturated", "g"),
+    "DietaryFatMonounsaturated": ("dietary_fat_monounsaturated", "g"),
+    "DietaryFatPolyunsaturated": ("dietary_fat_polyunsaturated", "g"),
+    "DietaryCholesterol": ("dietary_cholesterol", "mg"),
+    "DietarySodium": ("dietary_sodium", "mg"),
+    "DietaryCaffeine": ("dietary_caffeine", "mg"),
+    "DietaryCalcium": ("dietary_calcium", "mg"),
+    "DietaryIron": ("dietary_iron", "mg"),
+    "DietaryMagnesium": ("dietary_magnesium", "mg"),
+    "DietaryPotassium": ("dietary_potassium", "mg"),
+    "DietaryZinc": ("dietary_zinc", "mg"),
+    "DietaryFolate": ("dietary_folate", "mcg"),
+    "DietaryVitaminA": ("dietary_vitamin_a", "mcg"),
+    "DietaryVitaminB12": ("dietary_vitamin_b12", "mcg"),
+    "DietaryVitaminC": ("dietary_vitamin_c", "mg"),
+    "DietaryVitaminD": ("dietary_vitamin_d", "mcg"),
+    "DietaryVitaminE": ("dietary_vitamin_e", "mg"),
+    "DietaryVitaminK": ("dietary_vitamin_k", "mcg"),
+}
+HEALTHMD_OBSERVATION_MAPPINGS.update(
+    {
+        f"HKQuantityTypeIdentifier{identifier}": (metric, unit, unit, 1.0)
+        for identifier, (metric, unit) in HEALTHMD_DIETARY_MAPPINGS.items()
+    }
+)
 
 
 class ValidationError(ValueError):
@@ -355,6 +396,36 @@ def normalise_healthmd_observations(record: dict[str, Any]) -> list[dict[str, An
             )
             continue
 
+        if object_type == "HKCategoryTypeIdentifierHeadphoneAudioExposureEvent":
+            observations.append(
+                {
+                    "metric": "headphone_audio_alerts",
+                    "observed_at": end,
+                    "unit": "count",
+                    "value": 1.0,
+                    "duration_seconds": duration_seconds,
+                }
+            )
+            continue
+        if object_type == "HKWorkoutTypeIdentifier":
+            # Health.md v8 workouts carry type and duration but no statistics.
+            fields = payload.get("fields")
+            workout_duration = fields.get("durationSeconds") if isinstance(fields, dict) else None
+            workout_seconds = workout_duration.get("value") if isinstance(workout_duration, dict) else None
+            if not isinstance(workout_seconds, (int, float)) or isinstance(workout_seconds, bool):
+                continue
+            if not math.isfinite(workout_seconds) or workout_seconds <= 0:
+                continue
+            observations.append(
+                {
+                    "metric": "workout_duration",
+                    "observed_at": end,
+                    "unit": "s",
+                    "value": float(workout_seconds),
+                    "duration_seconds": duration_seconds,
+                }
+            )
+            continue
         if object_type != "HKCategoryTypeIdentifierSleepAnalysis":
             continue
         metric_name = sleep_field(payload)
